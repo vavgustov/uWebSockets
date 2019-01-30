@@ -23,19 +23,24 @@
 
 #include "WebSocketProtocol.h"
 
+#include "f2/function2.hpp"
+
 namespace uWS {
 
 template <bool, bool> struct WebSocket;
 
+/* todo: this looks identical to WebSocketBehavior, why not just std::move that entire thing in? */
+
 template <bool SSL>
 struct WebSocketContextData {
     /* The callbacks for this context */
-    std::function<void(WebSocket<SSL, true> *, std::string_view, uWS::OpCode)> messageHandler = nullptr;
-    std::function<void(uWS::WebSocket<SSL, true> *)> drainHandler = nullptr;
-    std::function<void(uWS::WebSocket<SSL, true> *, int, std::string_view)> closeHandler = nullptr;
+    fu2::unique_function<void(WebSocket<SSL, true> *, std::string_view, uWS::OpCode)> messageHandler = nullptr;
+    fu2::unique_function<void(WebSocket<SSL, true> *)> drainHandler = nullptr;
+    fu2::unique_function<void(WebSocket<SSL, true> *, int, std::string_view)> closeHandler = nullptr;
 
     /* Settings for this context */
     size_t maxPayloadLength = 0;
+    int idleTimeout = 0;
 };
 
 }

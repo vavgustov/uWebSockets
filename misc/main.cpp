@@ -12,10 +12,13 @@ int main(int argc, char **argv) {
         int hello;
     };
 
-    uWS::SSLApp({
+    auto app = uWS::/*SSL*/App({
         .key_file_name = "/home/alexhultman/key.pem",
         .cert_file_name = "/home/alexhultman/cert.pem",
         .passphrase = "1234"
+    }).any("/anything", [](auto *res, auto *req) {
+        std::cout << "Any route with method: " << req->getMethod() << std::endl;
+        res->end("Hello Any route!");
     }).get("/exit", [](auto *res, auto *req) {
 
         if (!token) {
@@ -32,7 +35,7 @@ int main(int argc, char **argv) {
         /* Settings */
         .compression = uWS::DEDICATED_COMPRESSOR,
         .maxPayloadLength = 16 * 1024 * 1024,
-        /* autoPingInterval */
+        .idleTimeout = 10,
         /* Handlers */
         .open = [](auto *ws, auto *req) {
             std::cout << "WebSocket connected" << std::endl;
@@ -67,8 +70,6 @@ int main(int argc, char **argv) {
         }
     }).run();
 
-    /* This is needed to properly free default loop and such resources */
-    uWS::destroy();
 
     std::cout << "Everything fine, falling through" << std::endl;
 

@@ -25,6 +25,8 @@
 #include <cstring>
 #include <algorithm>
 
+#include "f2/function2.hpp"
+
 namespace uWS {
 
 class HttpRequest {
@@ -37,10 +39,20 @@ private:
         std::string_view key, value;
     } headers[MAX_HEADERS];
     int querySeparator;
+    bool didYield;
 
     std::pair<int, std::string_view *> currentParameters;
 
 public:
+    bool getYield() {
+        return didYield;
+    }
+
+    /* If you do not want to handle this route */
+    void setYield(bool yield) {
+        didYield = yield;
+    }
+
     std::string_view getHeader(std::string_view header) {
         for (Header *h = headers; (++h)->key.length(); ) {
             if (h->key.length() == header.length() && !strncmp(h->key.data(), header.data(), header.length())) {
@@ -71,7 +83,7 @@ public:
         currentParameters = parameters;
     }
 
-    std::string_view getParameter(int index) {
+    std::string_view getParameter(unsigned int index) {
         if (currentParameters.first < index) {
             return {};
         } else {
@@ -128,7 +140,7 @@ private:
 
     // the only caller of getHeaders
     template <int CONSUME_MINIMALLY>
-    std::pair<int, void *> fenceAndConsumePostPadded(char *data, int length, void *user, HttpRequest *req, std::function<void *(void *, HttpRequest *)> &requestHandler, std::function<void *(void *, std::string_view, bool)> &dataHandler) {
+    std::pair<int, void *> fenceAndConsumePostPadded(char *data, int length, void *user, HttpRequest *req, fu2::unique_function<void *(void *, HttpRequest *)> &requestHandler, fu2::unique_function<void *(void *, std::string_view, bool)> &dataHandler) {
         int consumedTotal = 0;
         data[length] = '\r';
 
@@ -181,7 +193,7 @@ private:
 public:
 
     // todo: what can we do with the socket inside the handlers? we need to check on return from any handler if we closed or terminated or upgraded the socket
-    void *consumePostPadded(char *data, int length, void *user, std::function<void *(void *, HttpRequest *)> &&requestHandler, std::function<void *(void *, std::string_view, bool)> &&dataHandler, std::function<void *(void *)> &&errorHandler) {
+    void *consumePostPadded(char *data, int length, void *user, fu2::unique_function<void *(void *, HttpRequest *)> &&requestHandler, fu2::unique_function<void *(void *, std::string_view, bool)> &&dataHandler, fu2::unique_function<void *(void *)> &&errorHandler) {
 
         HttpRequest req;
 

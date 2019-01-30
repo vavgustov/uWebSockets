@@ -42,55 +42,62 @@ enum CompressOptions {
 };
 
 template <bool SSL>
-struct TemplatedApp : StaticDispatch<SSL> {
+struct TemplatedApp {
 private:
     /* The app always owns at least one http context, but creates websocket contexts on demand */
     HttpContext<SSL> *httpContext;
-
     std::vector<WebSocketContext<SSL, true> *> webSocketContexts;
 
-    using SOCKET_TYPE = typename StaticDispatch<SSL>::SOCKET_TYPE;
-    using StaticDispatch<SSL>::static_dispatch;
 public:
 
-    void registerTag() {
-
+    /* Attaches a "filter" function to track socket connections/disconnections */
+    void filter(fu2::unique_function<void(HttpResponse<SSL> *, int)> &&filterHandler) {
+        httpContext->filter(std::move(filterHandler));
     }
-
-    /* todo: Proper move semantics so to not allow copy-then-double-free and such problems of httpContext, etc. */
 
     ~TemplatedApp() {
         /* Let's just put everything here */
-        httpContext->free();
+        if (httpContext) {
+            httpContext->free();
 
-        for (auto *webSocketContext : webSocketContexts) {
-            webSocketContext->free();
+            for (auto *webSocketContext : webSocketContexts) {
+                webSocketContext->free();
+            }
         }
     }
 
-    TemplatedApp(const TemplatedApp &other) {
+    /* Disallow copying, only move */
+    TemplatedApp(const TemplatedApp &other) = delete;
+
+    TemplatedApp(TemplatedApp &&other) {
+        /* Move HttpContext */
         httpContext = other.httpContext;
+        other.httpContext = nullptr;
+
+        /* Move webSocketContexts */
+        webSocketContexts = std::move(other.webSocketContexts);
     }
 
-    TemplatedApp(us_ssl_socket_context_options sslOptions = {}) {
-        httpContext = uWS::HttpContext<SSL>::create(uWS::Loop::defaultLoop(), &sslOptions);
+    TemplatedApp(us_new_socket_context_options_t options = {}) {
+        httpContext = uWS::HttpContext<SSL>::create(uWS::Loop::defaultLoop(), options);
     }
 
     struct WebSocketBehavior {
         CompressOptions compression = DISABLED;
         int maxPayloadLength = 16 * 1024;
-        std::function<void(uWS::WebSocket<SSL, true> *, HttpRequest *)> open = nullptr;
-        std::function<void(uWS::WebSocket<SSL, true> *, std::string_view, uWS::OpCode)> message = nullptr;
-        std::function<void(uWS::WebSocket<SSL, true> *)> drain = nullptr;
-        std::function<void(uWS::WebSocket<SSL, true> *)> ping = nullptr;
-        std::function<void(uWS::WebSocket<SSL, true> *)> pong = nullptr;
-        std::function<void(uWS::WebSocket<SSL, true> *, int, std::string_view)> close = nullptr;
+        int idleTimeout = 120;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *, HttpRequest *)> open = nullptr;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *, std::string_view, uWS::OpCode)> message = nullptr;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> drain = nullptr;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> ping = nullptr;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *)> pong = nullptr;
+        fu2::unique_function<void(uWS::WebSocket<SSL, true> *, int, std::string_view)> close = nullptr;
     };
 
     template <class UserData>
-    TemplatedApp &ws(std::string pattern, WebSocketBehavior &&behavior) {
+    TemplatedApp &&ws(std::string pattern, WebSocketBehavior &&behavior) {
         /* Every route has its own websocket context with its own behavior and user data type */
-        auto *webSocketContext = WebSocketContext<SSL, true>::create(Loop::defaultLoop(), (typename StaticDispatch<SSL>::SOCKET_CONTEXT_TYPE *) httpContext);
+        auto *webSocketContext = WebSocketContext<SSL, true>::create(Loop::defaultLoop(), (us_new_socket_context_t *) httpContext);
 
         /* We need to clear this later on */
         webSocketContexts.push_back(webSocketContext);
@@ -102,7 +109,7 @@ public:
 
         /* If we are the first one to use compression, initialize it */
         if (behavior.compression) {
-            LoopData *loopData = (LoopData *) us_loop_ext(static_dispatch(us_ssl_socket_context_loop, us_socket_context_loop)(webSocketContext->getSocketContext()));
+            LoopData *loopData = (LoopData *) us_loop_ext(us_new_socket_context_loop(SSL, webSocketContext->getSocketContext()));
 
             /* Initialize loop's deflate inflate streams */
             if (!loopData->zlibContext) {
@@ -113,18 +120,19 @@ public:
         }
 
         /* Copy all handlers */
-        webSocketContext->getExt()->messageHandler = behavior.message;
-        webSocketContext->getExt()->drainHandler = behavior.drain;
-        webSocketContext->getExt()->closeHandler = behavior.close;
+        webSocketContext->getExt()->messageHandler = std::move(behavior.message);
+        webSocketContext->getExt()->drainHandler = std::move(behavior.drain);
+        webSocketContext->getExt()->closeHandler = std::move(behavior.close);
 
         /* Copy settings */
         webSocketContext->getExt()->maxPayloadLength = behavior.maxPayloadLength;
+        webSocketContext->getExt()->idleTimeout = behavior.idleTimeout;
 
-        return get(pattern, [webSocketContext, this, behavior](auto *res, auto *req) {
+        return std::move(get(pattern, [webSocketContext, this, behavior = std::move(behavior)](auto *res, auto *req) mutable {
             /* If we have this header set, it's a websocket */
             std::string_view secWebSocketKey = req->getHeader("sec-websocket-key");
             if (secWebSocketKey.length()) {
-                // note: OpenSSL can be used here to speed this up somewhat
+                /* Note: OpenSSL can be used here to speed this up somewhat */
                 char secWebSocketAccept[29] = {};
                 WebSocketHandshake::generate(secWebSocketKey.data(), secWebSocketAccept);
 
@@ -167,97 +175,103 @@ public:
                     }
                 }
 
-                /* Add mark, we don't want to end anything */
-                res->writeHeader("WebSocket-Server", "uWebSockets")->end();
+                /* This will add our mark */
+                res->end();
 
-                /* todo: What about HttpResponseData here? */
+                /* Move any backpressure */
+                std::string backpressure(std::move(((AsyncSocketData<SSL> *) res->getHttpResponseData())->buffer));
+
+                /* Destroy HttpResponseData */
+                res->getHttpResponseData()->~HttpResponseData();
 
                 /* Adopting a socket invalidates it, do not rely on it directly to carry any data */
-                WebSocket<SSL, true> *webSocket = (WebSocket<SSL, true> *) StaticDispatch<SSL>::static_dispatch(us_ssl_socket_context_adopt_socket, us_socket_context_adopt_socket)(
-                            (typename StaticDispatch<SSL>::SOCKET_CONTEXT_TYPE *) webSocketContext, (typename StaticDispatch<SSL>::SOCKET_TYPE *) res, sizeof(WebSocketData) + sizeof(UserData));
+                WebSocket<SSL, true> *webSocket = (WebSocket<SSL, true> *) us_new_socket_context_adopt_socket(SSL,
+                            (us_new_socket_context_t *) webSocketContext, (us_new_socket_t *) res, sizeof(WebSocketData) + sizeof(UserData));
 
                 /* Update corked socket in case we got a new one (assuming we always are corked in handlers). */
                 webSocket->cork();
 
+                /* Initialize websocket with any moved backpressure intact */
                 httpContext->upgradeToWebSocket(
-                            webSocket->init(perMessageDeflate, slidingDeflateWindow)
+                            webSocket->init(perMessageDeflate, slidingDeflateWindow, std::move(backpressure))
                             );
 
-                /* Emit open event */
+                /* Emit open event and start the timeout */
                 if (behavior.open) {
+                    us_new_socket_timeout(SSL, (us_new_socket_t *) webSocket, behavior.idleTimeout);
                     behavior.open(webSocket, req);
                 }
+
+                /* We are going to get uncorked by the Http get return */
 
                 /* We do not need to check for any close or shutdown here as we immediately return from get handler */
 
             } else {
-                /* For now we do not support having HTTP and websocket routes on the same URL */
-                res->close();
+                /* Tell the router that we did not handle this request */
+                req->setYield(true);
             }
-        });
-
-        // never called
-        return *this;
+        }));
     }
 
-    TemplatedApp &get(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("get", pattern, handler);
-        return *this;
+    TemplatedApp &&get(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("get", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &post(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("post", pattern, handler);
-        return *this;
+    TemplatedApp &&post(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("post", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &options(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("options", pattern, handler);
-        return *this;
+    TemplatedApp &&options(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("options", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &del(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("delete", pattern, handler);
-        return *this;
+    TemplatedApp &&del(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("delete", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &patch(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("patch", pattern, handler);
-        return *this;
+    TemplatedApp &&patch(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("patch", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &put(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("put", pattern, handler);
-        return *this;
+    TemplatedApp &&put(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("put", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &head(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("head", pattern, handler);
-        return *this;
+    TemplatedApp &&head(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("head", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &connect(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("connect", pattern, handler);
-        return *this;
+    TemplatedApp &&connect(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("connect", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &trace(std::string pattern, std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onHttp("trace", pattern, handler);
-        return *this;
+    TemplatedApp &&trace(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("trace", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &unhandled(std::function<void(HttpResponse<SSL> *, HttpRequest *)> handler) {
-        httpContext->onUnhandled(handler);
-        return *this;
+    /* This one catches any method */
+    TemplatedApp &&any(std::string pattern, fu2::unique_function<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+        httpContext->onHttp("*", pattern, std::move(handler));
+        return std::move(*this);
     }
 
-    TemplatedApp &listen(int port, std::function<void(us_listen_socket *)> handler) {
+    TemplatedApp &&listen(int port, fu2::unique_function<void(us_listen_socket *)> &&handler) {
         handler(httpContext->listen(nullptr, port, 0));
-        return *this;
+        return std::move(*this);
     }
 
-    TemplatedApp &run() {
+    TemplatedApp &&run() {
         uWS::run();
-        return *this;
+        return std::move(*this);
     }
 
 };

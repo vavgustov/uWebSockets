@@ -25,6 +25,8 @@
 #include "HttpContextData.h"
 #include "Utilities.h"
 
+#include "f2/function2.hpp"
+
 /* todo: tryWrite is missing currently, only send smaller segments with write */
 
 namespace uWS {
@@ -37,6 +39,8 @@ static const int HTTP_TIMEOUT_S = 10;
 
 template <bool SSL>
 struct HttpResponse : public AsyncSocket<SSL> {
+    /* Solely used for getHttpResponseData() */
+    template <bool> friend struct TemplatedApp;
     typedef AsyncSocket<SSL> Super;
 private:
     HttpResponseData<SSL> *getHttpResponseData() {
@@ -59,6 +63,21 @@ private:
 
         /* For now we do this copy */
         Super::write(buf, length);
+    }
+
+    /* When we are done with a response we mark it like so */
+    void markDone(HttpResponseData<SSL> *httpResponseData) {
+        httpResponseData->onAborted = nullptr;
+        /* Also remove onWritable so that we do not emit when draining behind the scenes. */
+        httpResponseData->onWritable = nullptr;
+
+        /* We are done with this request */
+        httpResponseData->state &= ~HttpResponseData<SSL>::HTTP_RESPONSE_PENDING;
+    }
+
+    /* Called only once per request */
+    void writeMark() {
+        writeHeader("uWebSockets", "v0.15");
     }
 
     /* Returns true on success, indicating that it might be feasible to write more data.
@@ -90,12 +109,17 @@ private:
             /* Terminating 0 chunk */
             Super::write("\r\n0\r\n\r\n", 7);
 
+            markDone(httpResponseData);
+
             /* tryEnd can never fail when in chunked mode, since we do not have tryWrite (yet), only write */
             Super::timeout(HTTP_TIMEOUT_S);
             return true;
         } else {
             /* Write content-length on first call */
             if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_END_CALLED)) {
+                /* Write mark, this propagates to WebSockets too */
+                writeMark();
+
                 /* Ending with no response should not leave any content-length */
                 if (totalSize) {
                     /* We have a known send size */
@@ -127,9 +151,7 @@ private:
 
             /* Remove onAborted function if we reach the end */
             if (httpResponseData->offset == totalSize) {
-                httpResponseData->onAborted = nullptr;
-                /* Also remove onWritable so that we do not emit when draining behind the scenes. */
-                httpResponseData->onWritable = nullptr;
+                markDone(httpResponseData);
             }
 
             return success;
@@ -204,6 +226,9 @@ public:
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED)) {
+            /* Write mark on first call to write */
+            writeMark();
+
             writeHeader("Transfer-Encoding", "chunked");
             httpResponseData->state |= HttpResponseData<SSL>::HTTP_WRITE_CALLED;
         }
@@ -228,26 +253,33 @@ public:
         return httpResponseData->offset;
     }
 
-    /* Attach handler for writable HTTP response */
-    HttpResponse *onWritable(std::function<bool(int)> handler) {
+    /* Checking if we have fully responded and are ready for another request */
+    bool hasResponded() {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
-        httpResponseData->onWritable = handler;
+        return !(httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING);
+    }
+
+    /* Attach handler for writable HTTP response */
+    HttpResponse *onWritable(fu2::unique_function<bool(int)> &&handler) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        httpResponseData->onWritable = std::move(handler);
         return this;
     }
 
     /* Attach handler for aborted HTTP request */
-    HttpResponse *onAborted(std::function<void()> handler) {
+    HttpResponse *onAborted(fu2::unique_function<void()> &&handler) {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
-        httpResponseData->onAborted = handler;
+        httpResponseData->onAborted = std::move(handler);
         return this;
     }
 
     /* Attach a read handler for data sent. Will be called with FIN set true if last segment. */
-    void onData(std::function<void(std::string_view, bool)> handler) {
+    void onData(fu2::unique_function<void(std::string_view, bool)> &&handler) {
         HttpResponseData<SSL> *data = getHttpResponseData();
-        data->inStream = handler;
+        data->inStream = std::move(handler);
     }
 };
 

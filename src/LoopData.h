@@ -25,18 +25,20 @@
 
 #include "PerMessageDeflate.h"
 
+#include "f2/function2.hpp"
+
 namespace uWS {
 
 struct Loop;
 
-struct LoopData {
+struct alignas(16) LoopData {
     friend struct Loop;
 private:
     std::mutex deferMutex;
     int currentDeferQueue = 0;
-    std::vector<std::function<void()>> deferQueues[2];
+    std::vector<fu2::unique_function<void()>> deferQueues[2];
 
-    std::function<void(Loop *)> postHandler;
+    fu2::unique_function<void(Loop *)> postHandler, preHandler;
 
 public:
     ~LoopData() {

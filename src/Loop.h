@@ -22,7 +22,7 @@
 
 #include "LoopData.h"
 
-#include <libusockets.h>
+#include <libusockets_new.h>
 
 
 
@@ -33,7 +33,6 @@ namespace uWS {
 struct Loop {
 private:
     static void wakeupCb(us_loop *loop) {
-        //std::cout << "wakeupCB called" << std::endl;
         LoopData *loopData = (LoopData *) us_loop_ext(loop);
 
         /* Swap current deferQueue */
@@ -50,7 +49,11 @@ private:
     }
 
     static void preCb(us_loop *loop) {
+        LoopData *loopData = (LoopData *) us_loop_ext(loop);
 
+        if (loopData->preHandler) {
+            loopData->preHandler((Loop *) loop);
+        }
     }
 
     static void postCb(us_loop *loop) {
@@ -62,10 +65,7 @@ private:
     }
 
     Loop() = delete;
-
-    ~Loop() {
-        std::cout << "Loop destructor called" << std::endl;
-    }
+    ~Loop() = default;
 
     Loop *init() {
         new (us_loop_ext((us_loop *) this)) LoopData;
@@ -107,28 +107,30 @@ public:
         LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
         loopData->~LoopData();
         us_loop_free((us_loop *) this);
-
-        std::cout << "Loop::free" << std::endl;
     }
 
     /* Set postCb callback */
-    void setPostHandler(std::function<void(Loop *)> handler) {
+    void setPostHandler(fu2::unique_function<void(Loop *)> &&handler) {
         LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
 
-        loopData->postHandler = handler;
+        loopData->postHandler = std::move(handler);
+    }
+
+    void setPreHandler(fu2::unique_function<void(Loop *)> &&handler) {
+        LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
+
+        loopData->preHandler = std::move(handler);
     }
 
     /* Defer this callback on Loop's thread of execution */
-    void defer(std::function<void()> cb) {
+    void defer(fu2::unique_function<void()> &&cb) {
         LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
 
-        //std::cout << "defer called" << std::endl;
         //if (std::thread::get_id() == ) // todo: add fast path for same thread id
         loopData->deferMutex.lock();
-        loopData->deferQueues[loopData->currentDeferQueue].emplace_back(cb);
+        loopData->deferQueues[loopData->currentDeferQueue].emplace_back(std::move(cb));
         loopData->deferMutex.unlock();
 
-        //std::cout << "us_wakeup_loop called" << std::endl;
         us_wakeup_loop((us_loop *) this);
     }
 
@@ -140,7 +142,7 @@ public:
     /* Passively integrate with the underlying default loop */
     /* Used to seamlessly integrate with third parties such as Node.js */
     void integrate() {
-
+        us_loop_integrate((us_loop *) this);
     }
 };
 

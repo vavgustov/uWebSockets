@@ -31,25 +31,25 @@ struct WebSocket : AsyncSocket<SSL> {
     template <bool> friend struct TemplatedApp;
 private:
     typedef AsyncSocket<SSL> Super;
-    using SOCKET_TYPE = typename StaticDispatch<SSL>::SOCKET_TYPE;
-    using SOCKET_CONTEXT_TYPE = typename StaticDispatch<SSL>::SOCKET_CONTEXT_TYPE;
-    using StaticDispatch<SSL>::static_dispatch;
 
-    void *init(bool perMessageDeflate, bool slidingCompression) {
-        new (static_dispatch(us_ssl_socket_ext, us_socket_ext)((SOCKET_TYPE *) this)) WebSocketData(perMessageDeflate, slidingCompression);
+    void *init(bool perMessageDeflate, bool slidingCompression, std::string &&backpressure) {
+        new (us_new_socket_ext(SSL, (us_new_socket_t *) this)) WebSocketData(perMessageDeflate, slidingCompression, std::move(backpressure));
         return this;
     }
 public:
 
     /* Returns pointer to the per socket user data */
     void *getUserData() {
-        WebSocketData *webSocketData = (WebSocketData *) static_dispatch(us_ssl_socket_ext, us_socket_ext)((SOCKET_TYPE *) this);
+        WebSocketData *webSocketData = (WebSocketData *) us_new_socket_ext(SSL, (us_new_socket_t *) this);
         /* We just have it overallocated by sizeof type */
         return (webSocketData + 1);
     }
 
     /* See AsyncSocket */
     using Super::getBufferedAmount;
+
+    /* Simple, immediate close of the socket. Emits close event */
+    using Super::close;
 
     /* Send or buffer a WebSocket frame, compressed or not. Returns false on increased user space backpressure. */
     bool send(std::string_view message, uWS::OpCode opCode = uWS::OpCode::BINARY, bool compress = false) {
@@ -89,33 +89,37 @@ public:
         return true;
     }
 
-    /* Emit close event, start passive timeout */
-    void close(int code, std::string_view message = {}) {
-        static const int MAX_CLOSE_PAYLOAD = 123;
-        int length = std::min<size_t>(MAX_CLOSE_PAYLOAD, message.length());
-
-        // todo: here we start a timeout and handle it accordingly in the timeout handler
-
-        WebSocketData *webSocketData = (WebSocketData *) static_dispatch(us_ssl_socket_ext, us_socket_ext)((SOCKET_TYPE *) this);
+    /* Send websocket close frame, emit close event, send FIN if successful */
+    void end(int code, std::string_view message = {}) {
+        /* Check if we already called this one */
+        WebSocketData *webSocketData = (WebSocketData *) us_new_socket_ext(SSL, (us_new_socket_t *) this);
+        if (webSocketData->isShuttingDown) {
+            return;
+        }
 
         /* We postpone any FIN sending to either drainage or uncorking */
         webSocketData->isShuttingDown = true;
 
         /* Format and send the close frame */
+        static const int MAX_CLOSE_PAYLOAD = 123;
+        int length = std::min<size_t>(MAX_CLOSE_PAYLOAD, message.length());
         char closePayload[MAX_CLOSE_PAYLOAD + 2];
         int closePayloadLength = protocol::formatClosePayload(closePayload, code, message.data(), length);
+        bool ok = send(std::string_view(closePayload, closePayloadLength), OpCode::CLOSE);
 
-        // but what if we are NOT corked, THEN we can FIN here if we succeeded
-
-        // if we are corked and send returns true we cannot know for sure if we can fin
-        send(std::string_view(closePayload, closePayloadLength), OpCode::CLOSE);
-
-        // why should we fin here?
-        //us_socket_shutdown((us_socket *) this);
+        /* FIN if we are ok and not corked */
+        WebSocket<SSL, true> *webSocket = (WebSocket<SSL, true> *) this;
+        if (!webSocket->isCorked()) {
+            if (ok) {
+                /* If we are not corked, and we just sent off everything, we need to FIN right here.
+                 * In all other cases, we need to fin either if uncork was successful, or when drainage is complete. */
+                webSocket->shutdown();
+            }
+        }
 
         /* Emit close event */
-        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) static_dispatch(us_ssl_socket_context_ext, us_socket_context_ext)(
-            (SOCKET_CONTEXT_TYPE *) static_dispatch(us_ssl_socket_get_context, us_socket_get_context)((SOCKET_TYPE *) this)
+        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_new_socket_context_ext(SSL,
+            (us_new_socket_context_t *) us_new_socket_context(SSL, (us_new_socket_t *) this)
         );
         if (webSocketContextData->closeHandler) {
             webSocketContextData->closeHandler(this, code, message);
