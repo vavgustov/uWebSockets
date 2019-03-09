@@ -79,7 +79,11 @@ public:
     }
 
     TemplatedApp(us_new_socket_context_options_t options = {}) {
-        httpContext = uWS::HttpContext<SSL>::create(uWS::Loop::defaultLoop(), options);
+        httpContext = uWS::HttpContext<SSL>::create(uWS::Loop::get(), options);
+    }
+
+    bool constructorFailed() {
+        return !httpContext;
     }
 
     struct WebSocketBehavior {
@@ -96,8 +100,12 @@ public:
 
     template <class UserData>
     TemplatedApp &&ws(std::string pattern, WebSocketBehavior &&behavior) {
+        /* Don't compile if alignment rules cannot be satisfied */
+        static_assert(alignof(UserData) <= LIBUS_EXT_ALIGNMENT,
+        "µWebSockets cannot satisfy UserData alignment requirements. You need to recompile µSockets with LIBUS_EXT_ALIGNMENT adjusted accordingly.");
+
         /* Every route has its own websocket context with its own behavior and user data type */
-        auto *webSocketContext = WebSocketContext<SSL, true>::create(Loop::defaultLoop(), (us_new_socket_context_t *) httpContext);
+        auto *webSocketContext = WebSocketContext<SSL, true>::create(Loop::get(), (us_new_socket_context_t *) httpContext);
 
         /* We need to clear this later on */
         webSocketContexts.push_back(webSocketContext);
@@ -161,7 +169,10 @@ public:
                         extensionsNegotiator.readOffer(extensions);
 
                         /* Todo: remove these mid string copies */
-                        res->writeHeader("Sec-WebSocket-Extensions", extensionsNegotiator.generateOffer());
+                        std::string offer = extensionsNegotiator.generateOffer();
+                        if (offer.length()) {
+                            res->writeHeader("Sec-WebSocket-Extensions", offer);
+                        }
 
                         /* Did we negotiate permessage-deflate? */
                         if (extensionsNegotiator.getNegotiatedOptions() & PERMESSAGE_DEFLATE) {
@@ -176,7 +187,7 @@ public:
                 }
 
                 /* This will add our mark */
-                res->end();
+                res->upgrade();
 
                 /* Move any backpressure */
                 std::string backpressure(std::move(((AsyncSocketData<SSL> *) res->getHttpResponseData())->buffer));
@@ -264,6 +275,13 @@ public:
         return std::move(*this);
     }
 
+    /* Host, port, callback */
+    TemplatedApp &&listen(std::string host, int port, fu2::unique_function<void(us_listen_socket *)> &&handler) {
+        handler(httpContext->listen(host.c_str(), port, 0));
+        return std::move(*this);
+    }
+
+    /* Port, callback */
     TemplatedApp &&listen(int port, fu2::unique_function<void(us_listen_socket *)> &&handler) {
         handler(httpContext->listen(nullptr, port, 0));
         return std::move(*this);

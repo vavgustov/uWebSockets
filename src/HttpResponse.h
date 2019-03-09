@@ -44,7 +44,7 @@ struct HttpResponse : public AsyncSocket<SSL> {
     typedef AsyncSocket<SSL> Super;
 private:
     HttpResponseData<SSL> *getHttpResponseData() {
-        return (HttpResponseData<SSL> *) Super::getExt();
+        return (HttpResponseData<SSL> *) Super::getAsyncSocketData();
     }
 
     /* Write an unsigned 32-bit integer in hex */
@@ -82,7 +82,7 @@ private:
 
     /* Returns true on success, indicating that it might be feasible to write more data.
      * Will start timeout if stream reaches totalSize or write failure. */
-    bool internalEnd(std::string_view data, int totalSize, bool optional) {
+    bool internalEnd(std::string_view data, int totalSize, bool optional, bool allowContentLength = true) {
         /* Write status if not already done */
         writeStatus(HTTP_200_OK);
 
@@ -120,9 +120,9 @@ private:
                 /* Write mark, this propagates to WebSockets too */
                 writeMark();
 
-                /* Ending with no response should not leave any content-length */
-                if (totalSize) {
-                    /* We have a known send size */
+                /* WebSocket upgrades does not allow content-length */
+                if (allowContentLength) {
+                    /* Even zero is a valid content-length */
                     Super::write("Content-Length: ", 16);
                     writeUnsigned(totalSize);
                     Super::write("\r\n\r\n", 4);
@@ -158,9 +158,16 @@ private:
         }
     }
 
+    /* This call is identical to end, but will never write content-length and is thus suitable for upgrades */
+    void upgrade() {
+        internalEnd({nullptr, 0}, 0, false, false);
+    }
+
 public:
     /* Immediately terminate this Http response */
     using Super::close;
+
+    using Super::getRemoteAddress;
 
     /* Note: Headers are not checked in regards to timeout.
      * We only check when you actively push data or end the request */
@@ -208,9 +215,10 @@ public:
         internalEnd(data, data.length(), false);
     }
 
-    /* Try and end the response. Returns true on success. Starts a timeout in some cases. */
-    bool tryEnd(std::string_view data, int totalSize = 0) {
-        return internalEnd(data, totalSize, true);
+    /* Try and end the response. Returns [true, true] on success.
+     * Starts a timeout in some cases. Returns [ok, hasResponded] */
+    std::pair<bool, bool> tryEnd(std::string_view data, int totalSize = 0) {
+        return {internalEnd(data, totalSize, true), hasResponded()};
     }
 
     /* Write parts of the response in chunking fashion. Starts timeout if failed. */

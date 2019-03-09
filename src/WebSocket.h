@@ -21,6 +21,7 @@
 #include "WebSocketData.h"
 #include "WebSocketProtocol.h"
 #include "AsyncSocket.h"
+#include "WebSocketContextData.h"
 
 #include <string_view>
 
@@ -47,6 +48,7 @@ public:
 
     /* See AsyncSocket */
     using Super::getBufferedAmount;
+    using Super::getRemoteAddress;
 
     /* Simple, immediate close of the socket. Emits close event */
     using Super::close;
@@ -55,7 +57,7 @@ public:
     bool send(std::string_view message, uWS::OpCode opCode = uWS::OpCode::BINARY, bool compress = false) {
         /* Transform the message to compressed domain if requested */
         if (compress) {
-            WebSocketData *webSocketData = (WebSocketData *) Super::getExt();
+            WebSocketData *webSocketData = (WebSocketData *) Super::getAsyncSocketData();
 
             /* Check and correct the compress hint */
             if (opCode < 3 && webSocketData->compressionStatus == WebSocketData::ENABLED) {
@@ -124,6 +126,34 @@ public:
         if (webSocketContextData->closeHandler) {
             webSocketContextData->closeHandler(this, code, message);
         }
+
+        /* Make sure to unsubscribe from any pub/sub node at exit */
+        webSocketContextData->topicTree.unsubscribeAll(this);
+    }
+
+    /* Subscribe to a topic according to MQTT rules and syntax */
+    void subscribe(std::string_view topic) {
+        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_new_socket_context_ext(SSL,
+            (us_new_socket_context_t *) us_new_socket_context(SSL, (us_new_socket_t *) this)
+        );
+
+        /* Fix this up */
+        bool *valid = new bool;
+        *valid = true;
+        webSocketContextData->topicTree.subscribe(std::string(topic), this, valid);
+    }
+
+    /* Publish a message to a topic according to MQTT rules and syntax */
+    void publish(std::string_view topic, std::string_view message) {
+        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_new_socket_context_ext(SSL,
+            (us_new_socket_context_t *) us_new_socket_context(SSL, (us_new_socket_t *) this)
+        );
+
+        /* We frame the message right here and only pass raw bytes to the pub/subber */
+        char dst[1024];
+        size_t dst_length = protocol::formatMessage<true>(dst, message.data(), message.length(), OpCode::TEXT, message.length(), false);
+
+        webSocketContextData->topicTree.publish(std::string(topic), dst, dst_length);
     }
 };
 

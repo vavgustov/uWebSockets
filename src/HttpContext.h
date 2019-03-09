@@ -22,13 +22,10 @@
 
 #include "Loop.h"
 #include "HttpContextData.h"
-
 #include "HttpResponseData.h"
 #include "AsyncSocket.h"
 
 #include <string_view>
-#include <functional>
-
 #include "f2/function2.hpp"
 
 namespace uWS {
@@ -36,6 +33,7 @@ template<bool> struct HttpResponse;
 
 template <bool SSL>
 struct HttpContext {
+    template<bool> friend struct TemplatedApp;
 private:
     HttpContext() = delete;
 
@@ -61,7 +59,7 @@ private:
     /* Init the HttpContext by registering libusockets event handlers */
     HttpContext<SSL> *init() {
         /* Handle socket connections */
-        us_new_socket_context_on_open(SSL, getSocketContext(), [](auto *s, int is_client) {
+        us_new_socket_context_on_open(SSL, getSocketContext(), [](auto *s, int is_client, char *ip, int ip_length) {
             /* Any connected socket should timeout until it has a request */
             us_new_socket_timeout(SSL, s, HTTP_IDLE_TIMEOUT_S);
 
@@ -176,11 +174,23 @@ private:
                     std::terminate();
                 }
 
+                /* If we have not responded and we have a data handler, we need to timeout to enfore client sending the data */
+                if (!((HttpResponse<SSL> *) s)->hasResponded() && httpResponseData->inStream) {
+                    us_new_socket_timeout(SSL, (us_new_socket_t *) s, HTTP_IDLE_TIMEOUT_S);
+                }
+
                 /* Continue parsing */
                 return s;
 
             }, [httpResponseData](void *user, std::string_view data, bool fin) -> void * {
+                /* We always get an empty chunk even if there is no data */
                 if (httpResponseData->inStream) {
+
+                    /* Getting a chunk of data while having a data handler should reset timeout (todo: if last, short timeout, if not last, bigger timeout) */
+                    /* Really, we only need to reset timeout to the larger delay if we are not fin */
+                    us_new_socket_timeout(SSL, (struct us_new_socket_t *) user, HTTP_IDLE_TIMEOUT_S);
+
+                    /* We might respond in the handler, so do not change timeout after this */
                     httpResponseData->inStream(data, fin);
 
                     /* Was the socket closed? */
@@ -219,14 +229,14 @@ private:
         /* Handle HTTP write out (note: SSL_read may trigger this spuriously, the app need to handle spurious calls) */
         us_new_socket_context_on_writable(SSL, getSocketContext(), [](auto *s) {
 
-            /* We are now writable, so hang timeout again */
-            us_new_socket_timeout(SSL, s, 0);
-
             AsyncSocket<SSL> *asyncSocket = (AsyncSocket<SSL> *) s;
-            HttpResponseData<SSL> *httpResponseData = (HttpResponseData<SSL> *) asyncSocket->getExt();
+            HttpResponseData<SSL> *httpResponseData = (HttpResponseData<SSL> *) asyncSocket->getAsyncSocketData();
 
             /* Ask the developer to write data and return success (true) or failure (false), OR skip sending anything and return success (true). */
             if (httpResponseData->onWritable) {
+                /* We are now writable, so hang timeout again, the user does not have to do anything so we should hang until end or tryEnd rearms timeout */
+                us_new_socket_timeout(SSL, s, 0);
+
                 /* We expect the developer to return whether or not write was successful (true).
                  * If write was never called, the developer should still return true so that we may drain. */
                 bool success = httpResponseData->onWritable(httpResponseData->offset);
@@ -236,13 +246,17 @@ private:
                     /* Skip testing if we can drain anything since that might perform an extra syscall */
                     return s;
                 }
+
+                /* We don't want to fall through since we don't want to mess with timeout.
+                 * It makes little sense to drain any backpressure when the user has registered onWritable. */
+                return s;
             }
 
-            /* Drain any socket buffer and timeout on failure */
+            /* Drain any socket buffer, this might empty our backpressure and thus finish the request */
             auto [written, failed] = asyncSocket->write(nullptr, 0, true, 0);
-            if (failed) {
-                asyncSocket->timeout(HTTP_IDLE_TIMEOUT_S);
-            }
+
+            /* Expect another writable event, or another request within the timeout */
+            asyncSocket->timeout(HTTP_IDLE_TIMEOUT_S);
 
             return s;
         });
@@ -266,6 +280,13 @@ private:
         });
 
         return this;
+    }
+
+    /* Used by App in its WebSocket handler */
+    void upgradeToWebSocket(void *newSocket) {
+        HttpContextData<SSL> *httpContextData = getSocketContextData();
+
+        httpContextData->upgradedWebSocket = newSocket;
     }
 
 public:
@@ -313,13 +334,6 @@ public:
             }
             return true;
         });
-    }
-
-    // this should not be public
-    void upgradeToWebSocket(void *newSocket) {
-        HttpContextData<SSL> *httpContextData = getSocketContextData();
-
-        httpContextData->upgradedWebSocket = newSocket;
     }
 
     /* Listen to port using this HttpContext */

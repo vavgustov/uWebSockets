@@ -21,13 +21,7 @@
 /* The loop is lazily created per-thread and run with uWS::run() */
 
 #include "LoopData.h"
-
 #include <libusockets_new.h>
-
-
-
-
-#include <iostream>
 
 namespace uWS {
 struct Loop {
@@ -54,10 +48,20 @@ private:
         if (loopData->preHandler) {
             loopData->preHandler((Loop *) loop);
         }
+
+        /* trying this one here */
+        for (auto &f : loopData->postHandlers) {
+            f((Loop *) loop);
+        }
     }
 
     static void postCb(us_loop *loop) {
         LoopData *loopData = (LoopData *) us_loop_ext(loop);
+
+        /* We should move over to using only these */
+        for (auto &f : loopData->postHandlers) {
+            f((Loop *) loop);
+        }
 
         if (loopData->postHandler) {
             loopData->postHandler((Loop *) loop);
@@ -72,41 +76,46 @@ private:
         return this;
     }
 
+    /* Todo: should take void ptr */
     static Loop *create(bool defaultLoop) {
         return ((Loop *) us_create_loop(defaultLoop, wakeupCb, preCb, postCb, sizeof(LoopData)))->init();
     }
 
 public:
-    /* Returns the default loop if called from one thread, or a dedicated per-thread loop if called from multiple threads */
-    static Loop *defaultLoop() {
-        /* Deliver and attach the default loop to the first thread who calls us */
-        static thread_local bool ownsDefaultLoop;
-        static Loop *defaultLoop;
-        if (!defaultLoop) {
-            ownsDefaultLoop = true;
-            defaultLoop = create(true);
-            std::atexit([]() {
-                Loop::defaultLoop()->free();
-            });
-            return defaultLoop;
-        } else if (ownsDefaultLoop) {
-            return defaultLoop;
+    /* Lazily initializes a per-thread loop and returns it.
+     * Will automatically free all initialized loops at exit. */
+    static Loop *get(void *existingNativeLoop = nullptr) {
+        static thread_local Loop *lazyLoop;
+        if (!lazyLoop) {
+            /* If we are given a native loop pointer we pass that to uSockets and let it deal with it */
+            if (existingNativeLoop) {
+                /* Todo: here we want to pass the pointer, not a boolean */
+                lazyLoop = create(true);
+                /* We cannot register automatic free here, must be manually done */
+            } else {
+                lazyLoop = create(false);
+                std::atexit([]() {
+                    Loop::get()->free();
+                });
+            }
         }
 
-        /* Other threads get their non-default loops lazily created */
-        static thread_local Loop *threadLocalLoop;
-        if (!threadLocalLoop) {
-            threadLocalLoop = create(false);
-            return threadLocalLoop;
-        }
-        return threadLocalLoop;
+        return lazyLoop;
     }
 
     /* Freeing the default loop should be done once */
     void free() {
         LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
         loopData->~LoopData();
+        /* uSockets will track whether this loop is owned by us or a borrowed alien loop */
         us_loop_free((us_loop *) this);
+    }
+
+    /* We want to have multiple of these */
+    void addPostHandler(fu2::unique_function<void(Loop *)> &&handler) {
+        LoopData *loopData = (LoopData *) us_loop_ext((us_loop *) this);
+
+        loopData->postHandlers.emplace_back(std::move(handler));
     }
 
     /* Set postCb callback */
@@ -148,7 +157,7 @@ public:
 
 /* Can be called from any thread to run the thread local loop */
 inline void run() {
-    Loop::defaultLoop()->run();
+    Loop::get()->run();
 }
 
 }
